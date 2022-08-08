@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/servicequotas"
@@ -49,6 +51,73 @@ type VPCCollector struct {
 	serviceQuotas *servicequotas.ServiceQuotas
 	region        *string
 	wg            *sync.WaitGroup
+}
+
+type AWSInput interface {
+	*ec2.DescribeVpcsInput | *ec2.DescribeRouteTablesInput | *ec2.DescribeSubnetsInput | *ec2.DescribeVpcEndpointsInput
+}
+
+type AWSOutput interface {
+	*ec2.DescribeVpcsOutput | *ec2.DescribeRouteTablesOutput | *ec2.DescribeSubnetsOutput | *ec2.DescribeVpcEndpointsOutput
+}
+
+func Paginate[I interface{ SetNextToken(string) I }, O AWSOutput](logger log.Logger, f func(ctx context.Context, i I, opts ...request.Option) (O, error), input I, timeout time.Duration) ([]O, error) {
+	checkPagination := func(out O) string {
+		var nextToken string
+		// Replace reflection with utilizing NextToken once access to common members is possible.
+		// https://github.com/golang/go/issues/48522
+		typeReflect := reflect.TypeOf(out).Elem()
+		// We only get pointers, so we have to access the element
+		valueReflect := reflect.ValueOf(out).Elem()
+		indirectOut := reflect.Indirect(valueReflect)
+		for field := 0; field < indirectOut.NumField(); field++ {
+			fieldName := typeReflect.Field(field).Name
+			if fieldName == "NextToken" {
+				nextToken = indirectOut.Field(field).Elem().String()
+				level.Info(logger).Log("msg", "Found next token", "token", nextToken)
+				break
+			}
+		}
+		return nextToken
+	}
+	var os []O
+	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
+	defer cancelFunc()
+	out, err := f(ctx, input)
+	os = append(os, out)
+	for {
+		nextToken := checkPagination(out)
+		if nextToken == "" || nextToken == "<invalid Value>" {
+			level.Info(logger).Log("msg", "No pagination required - all results available.")
+			return os, err
+		} else {
+			level.Info(logger).Log("msg", "Pagination occured, retrieving more results.")
+			input.SetNextToken(nextToken)
+			out, err = f(ctx, input)
+			os = append(os, out)
+			if err != nil {
+				level.Error(logger).Log("msg", "Paginated call failed")
+				exporterMetrics.IncrementErrors()
+				return os, err
+			}
+		}
+	}
+}
+
+func RetryableAWSCall[I AWSInput, O AWSOutput](logger log.Logger, f func(ctx context.Context, i I, opts ...request.Option) (O, error), input I, retries int, timeout time.Duration) (O, error) {
+	var err error
+	var out O
+	ctx, cancelFunc := context.WithTimeout(context.Background(), timeout)
+	defer cancelFunc()
+	for i := 1; i <= retries; i++ {
+		out, err = f(ctx, input)
+		if err != nil {
+			level.Info(logger).Log("msg", "Attempt failed will retry")
+		} else {
+			return out, err
+		}
+	}
+	return out, err
 }
 
 func NewVPCExporter(sess []*session.Session, logger log.Logger, timeout time.Duration) *VPCExporter {
@@ -151,9 +220,7 @@ func (c *VPCCollector) collectVpcsPerRegionQuota(ch chan<- prometheus.Metric) {
 }
 
 func (c *VPCCollector) collectVpcsPerRegionUsage(ch chan<- prometheus.Metric) {
-	ctx, cancelFunc := context.WithTimeout(context.Background(), c.e.timeout)
-	defer cancelFunc()
-	describeVpcsOutput, err := c.ec2.DescribeVpcsWithContext(ctx, &ec2.DescribeVpcsInput{})
+	describeVpcsOutput, err := RetryableAWSCall[*ec2.DescribeVpcsInput, *ec2.DescribeVpcsOutput](c.e.logger, c.ec2.DescribeVpcsWithContext, &ec2.DescribeVpcsInput{}, 5, c.e.timeout)
 	if err != nil {
 		level.Error(c.e.logger).Log("msg", "Call to DescribeVpcs failed", "region", c.region, "err", err)
 		exporterMetrics.IncrementErrors()
@@ -174,14 +241,10 @@ func (c *VPCCollector) collectSubnetsPerVpcQuota(ch chan<- prometheus.Metric) {
 }
 
 func (c *VPCCollector) collectSubnetsPerVpcUsage(ch chan<- prometheus.Metric, vpc *ec2.Vpc) {
-	ctx, cancelFunc := context.WithTimeout(context.Background(), c.e.timeout)
-	defer cancelFunc()
-	describeSubnetsOutput, err := c.ec2.DescribeSubnetsWithContext(ctx, &ec2.DescribeSubnetsInput{
-		Filters: []*ec2.Filter{&ec2.Filter{
-			Name:   aws.String("vpc-id"),
-			Values: []*string{vpc.VpcId},
-		}},
-	})
+	describeSubnetsOutput, err := RetryableAWSCall[*ec2.DescribeSubnetsInput, *ec2.DescribeSubnetsOutput](c.e.logger, c.ec2.DescribeSubnetsWithContext, &ec2.DescribeSubnetsInput{Filters: []*ec2.Filter{&ec2.Filter{
+		Name:   aws.String("vpc-id"),
+		Values: []*string{vpc.VpcId},
+	}}}, 5, c.e.timeout)
 	if err != nil {
 		level.Error(c.e.logger).Log("msg", "Call to DescribeSubnets failed", "region", c.region, "err", err)
 		exporterMetrics.IncrementErrors()
@@ -202,11 +265,9 @@ func (c *VPCCollector) collectRoutesPerRouteTableQuota(ch chan<- prometheus.Metr
 }
 
 func (c *VPCCollector) collectRoutesPerRouteTableUsage(ch chan<- prometheus.Metric, rtb *ec2.RouteTable) {
-	ctx, cancelFunc := context.WithTimeout(context.Background(), c.e.timeout)
-	defer cancelFunc()
-	descRouteTableOutput, err := c.ec2.DescribeRouteTablesWithContext(ctx, &ec2.DescribeRouteTablesInput{
+	descRouteTableOutput, err := RetryableAWSCall[*ec2.DescribeRouteTablesInput, *ec2.DescribeRouteTablesOutput](c.e.logger, c.ec2.DescribeRouteTablesWithContext, &ec2.DescribeRouteTablesInput{
 		RouteTableIds: []*string{rtb.RouteTableId},
-	})
+	}, 5, c.e.timeout)
 	if err != nil {
 		level.Error(c.e.logger).Log("msg", "Call to DescribeRouteTables failed", "region", c.region, "err", err)
 		exporterMetrics.IncrementErrors()
@@ -227,20 +288,21 @@ func (c *VPCCollector) collectInterfaceVpcEndpointsPerVpcQuota(ch chan<- prometh
 }
 
 func (c *VPCCollector) collectInterfaceVpcEndpointsPerVpcUsage(ch chan<- prometheus.Metric, vpc *ec2.Vpc) {
-	ctx, cancelFunc := context.WithTimeout(context.Background(), c.e.timeout)
-	defer cancelFunc()
-	descVpcEndpoints, err := c.ec2.DescribeVpcEndpointsWithContext(ctx, &ec2.DescribeVpcEndpointsInput{
+	descVpcEndpoints, err := Paginate[*ec2.DescribeVpcEndpointsInput, *ec2.DescribeVpcEndpointsOutput](c.e.logger, c.ec2.DescribeVpcEndpointsWithContext, &ec2.DescribeVpcEndpointsInput{
 		Filters: []*ec2.Filter{{
 			Name:   aws.String("vpc-id"),
 			Values: []*string{vpc.VpcId},
 		}},
-	})
+	}, c.e.timeout)
 	if err != nil {
 		level.Error(c.e.logger).Log("msg", "Call to DescribeVpcEndpoints failed", "region", c.region, "err", err)
 		exporterMetrics.IncrementErrors()
 		return
 	}
-	quota := len(descVpcEndpoints.VpcEndpoints)
+	var quota int
+	for _, endpoints := range descVpcEndpoints {
+		quota += len(endpoints.VpcEndpoints)
+	}
 	ch <- prometheus.MustNewConstMetric(c.e.InterfaceVpcEndpointsPerVpcUsage, prometheus.GaugeValue, float64(quota), *c.region, *vpc.VpcId)
 }
 
@@ -255,14 +317,12 @@ func (c *VPCCollector) collectRoutesTablesPerVpcQuota(ch chan<- prometheus.Metri
 }
 
 func (c *VPCCollector) collectRoutesTablesPerVpcUsage(ch chan<- prometheus.Metric, vpc *ec2.Vpc) {
-	ctx, cancelFunc := context.WithTimeout(context.Background(), c.e.timeout)
-	defer cancelFunc()
-	descRouteTables, err := c.ec2.DescribeRouteTablesWithContext(ctx, &ec2.DescribeRouteTablesInput{
+	descRouteTables, err := RetryableAWSCall[*ec2.DescribeRouteTablesInput, *ec2.DescribeRouteTablesOutput](c.e.logger, c.ec2.DescribeRouteTablesWithContext, &ec2.DescribeRouteTablesInput{
 		Filters: []*ec2.Filter{{
 			Name:   aws.String("vpc-id"),
 			Values: []*string{vpc.VpcId},
 		}},
-	})
+	}, 5, c.e.timeout)
 	if err != nil {
 		level.Error(c.e.logger).Log("msg", "Call to DescribeRouteTables failed", "region", c.region, "err", err)
 		exporterMetrics.IncrementErrors()
@@ -283,11 +343,9 @@ func (c *VPCCollector) collectIPv4BlocksPerVpcQuota(ch chan<- prometheus.Metric)
 }
 
 func (c *VPCCollector) collectIPv4BlocksPerVpcUsage(ch chan<- prometheus.Metric, vpc *ec2.Vpc) {
-	ctx, cancelFunc := context.WithTimeout(context.Background(), c.e.timeout)
-	defer cancelFunc()
-	descVpcs, err := c.ec2.DescribeVpcsWithContext(ctx, &ec2.DescribeVpcsInput{
+	descVpcs, err := RetryableAWSCall[*ec2.DescribeVpcsInput, *ec2.DescribeVpcsOutput](c.e.logger, c.ec2.DescribeVpcsWithContext, &ec2.DescribeVpcsInput{
 		VpcIds: []*string{vpc.VpcId},
-	})
+	}, 5, c.e.timeout)
 	if err != nil {
 		level.Error(c.e.logger).Log("msg", "Call to DescribeVpcs failed", "region", c.region, "err", err)
 		exporterMetrics.IncrementErrors()
